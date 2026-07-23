@@ -10,32 +10,11 @@ scipy>=1.11
 gsd>=3.2
 matplotlib>=3.8
 
-Repository layout
-
-.
-├── simulation/
-│   ├── espresso_ljgauss_2d_thermal_cycle.py
-│   └── run_ljgauss_2d_thermal_cycles.py
-├── analysis/
-│   ├── analyze_ljgauss_thermal_cycles.py
-│   └── run_analysis.sh
-├── figures/
-│   ├── article_figure_01_structural_pathway.py
-│   ├── article_figure_02_topological_reconstruction.py
-│   ├── article_figure_03_chain_geometry.py
-│   ├── article_figure_04_topology_dynamics.py
-│   ├── article_figure_05_cluster_cycle_distributions.py
-│   └── make_supplemental_figures.py
-├── requirements-analysis.txt
-└── README.md
-
-Simulation outputs and generated figures are intentionally excluded from Gitthrough .gitignore.
-
 Software requirements
 
-The simulations require ESPResSo with itsPython interface and the Lennard-Jones and tabulated nonbonded interactionsenabled. The scripts were prepared for ESPResSo 4.3.x and use pypresso.
+The simulations require ESPResSo with its Python interface and the Lennard-Jones and tabulated nonbonded interactions enabled. The scripts were prepared for ESPResSo 4.3.x and use pypresso.
 
-The structural analysis should be run in an ordinary Python environment,separate from ESPResSo if desired:
+The structural analysis should be run in an ordinary Python environment, separate from ESPResSo if desired:
 
 python3 -m venv analysis_env
 source analysis_env/bin/activate
