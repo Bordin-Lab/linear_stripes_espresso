@@ -4,6 +4,12 @@ This repository contains the simulation, analysis, and plotting scripts usedto s
 
 The production protocol follows continuous isochoric heating and coolingpaths. The same configuration is propagated through all temperatures, so thethermal history is preserved. Structural, graph-topological, filament, anddynamical observables are obtained from the saved trajectories.
 
+Requirements:
+numpy>=1.26
+scipy>=1.11
+gsd>=3.2
+matplotlib>=3.8
+
 Repository layout
 
 .
