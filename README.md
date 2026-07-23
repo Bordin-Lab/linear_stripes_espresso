@@ -218,7 +218,7 @@ orientational_correlation_by_seed.dat;
 
 frame-resolved and MSD-resolved files below per_seed/.
 
-The generated analysis/README.txt documents every output column and theweighting conventions used in the distributions.
+The generated analysis/README.txt documents every output column and the weighting conventions used in the distributions.
 
 Reproducing the figures
 
@@ -231,22 +231,23 @@ python figures/article_figure_04_topology_dynamics.py
 python figures/article_figure_05_cluster_cycle_distributions.py
 python figures/make_supplemental_figures.py
 
-The main figures are written to article_figures/; Supplemental figures arewritten to supplemental_figures/. All figure scripts accept explicit inputand output paths through their command-line options, exceptmake_supplemental_figures.py, whose paths are defined near the beginning ofthe file.
+The main figures are written to article_figures/; Supplemental figures are written to supplemental_figures/. All figure scripts accept explicit input and output paths through their command-line options, exceptmake_supplemental_figures.py, whose paths are defined near the beginning of the file.
 
 Reproducibility notes
 
-Heating and cooling are path-dependent finite-rate protocols; they shouldnot be interpreted automatically as equilibrium coexistence branches.
+Heating and cooling are path-dependent finite-rate protocols; they should not be interpreted automatically as equilibrium coexistence branches.
 
 The four seeds are averaged with equal statistical weight.
 
-Structural averages are first evaluated within each seed and then combinedacross seeds.
+Structural averages are first evaluated within each seed and then combined across seeds.
 
-Individual fundamental-cycle lengths depend on the selected cycle basis,whereas the number of basis elements equals the invariant cycle rankbeta1.
+Individual fundamental-cycle lengths depend on the selected cycle basis, whereas the number of basis elements equals the invariant cycle rankbeta1.
 
-Winding components are detected using integer periodic-image offsets, notonly by the size of the largest cluster.
+Winding components are detected using integer periodic-image offsets, not only by the size of the largest cluster.
 
 The simulation aborts if the initial minimum particle separation is below0.8 sigma.
 
 Citation
 
-If these scripts are used in published work, please cite the associatedarticle. The full citation and DOI should be added here after publication.
+If these scripts are used in published work, please cite this repository https://doi.org/10.5281/zenodo.21512438
+ and the associated article. The full citation and DOI should be added here after publication.
