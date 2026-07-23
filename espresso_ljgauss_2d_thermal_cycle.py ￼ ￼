@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Continuous heating/cooling isochores for the 2D LJ+Gaussian model.
+
+The same particle configuration is carried through every temperature.  This is
+essential for thermal hysteresis.  Each state point gets its own trajectory,
+thermodynamic time series, MSD/VACF, summary and final restart file.
+"""
+from __future__ import annotations
+
+import argparse, json, math
+from pathlib import Path
+from typing import Tuple
+import numpy as np
+import espressomd
+
+
+def lj_gauss_u_f(r, eps, sigma, A, r0, c):
+    x = sigma / r
+    lj = 4.0 * eps * (x**12 - x**6)
+    z = (r - r0 * sigma) / (c * sigma)
+    gauss = A * eps * np.exp(-z*z)
+    dlj = 4.0 * eps * (-12*sigma**12/r**13 + 6*sigma**6/r**7)
+    dgauss = gauss * (-2*(r-r0*sigma)/(c*sigma)**2)
+    return lj + gauss, -(dlj + dgauss)
+
+
+def gaussian_table(args):
+    """Tabulate only the smooth Gaussian contribution.
+
+    The singular LJ core is handled by ESPResSo's native LJ interaction, so it
+    remains repulsive at every r and cannot be lost below a tabulation minimum.
+    """
+    r = np.linspace(args.r_min, args.r_cut, args.table_points)
+    z = (r - args.gauss_r0 * args.sigma) / (args.gauss_c * args.sigma)
+    u = args.gauss_A * args.eps * np.exp(-(z*z))
+    f = u * 2.0 * (r - args.gauss_r0 * args.sigma) / ((args.gauss_c * args.sigma)**2)
+    zc = (args.r_cut - args.gauss_r0 * args.sigma) / (args.gauss_c * args.sigma)
+    u_cut = args.gauss_A * args.eps * math.exp(-(zc*zc))
+    return u-u_cut, f
+
+
+def grid_positions(N, L, seed):
+    rng = np.random.default_rng(seed)
+    n = int(math.ceil(math.sqrt(N))); a = L/n
+    q = np.array([((i+.5)*a, (j+.5)*a, 0.) for i in range(n) for j in range(n)])[:N]
+    q[:, :2] = (q[:, :2] + rng.uniform(-.08, .08, (N, 2))*a) % L
+    return q
+
+
+def get_state(system, N, box):
+    folded=np.empty((N,2)); unwrapped=np.empty((N,2)); vel=np.empty((N,2))
+    images=np.empty((N,2), dtype=int)
+    for i,p in enumerate(system.part):
+        folded[i]=p.pos[:2]; images[i]=p.image_box[:2]
+        unwrapped[i]=folded[i]+images[i]*box; vel[i]=p.v[:2]
+    return folded, unwrapped, vel, images
+
+
+def save_restart(path, system, N, box, T, direction):
+    folded, _, vel, images = get_state(system,N,box)
+    np.savez_compressed(path, pos=folded, vel=vel, image_box=images,
+                       box=box, Lx=box[0], Ly=box[1], T=T, direction=direction, time=system.time)
+
+
+def write_gsd(g, system, N, box):
+    import gsd.hoomd
+    folded,_,vel,images=get_state(system,N,box)
+    fr=gsd.hoomd.Frame(); fr.configuration.step=int(round(system.time/system.time_step))
+    fr.configuration.box=[box[0],box[1],1.,0.,0.,0.]; fr.particles.N=N
+    fr.particles.position=np.c_[folded[:,0]-box[0]/2,folded[:,1]-box[1]/2,np.zeros(N)]
+    # GSD positions are wrapped into the primary box.  Store the ESPResSo
+    # image counters as well, so downstream analysis can reconstruct exact
+    # unwrapped coordinates.  The analyzer also supports legacy files that do
+    # not contain this field by applying a minimum-image frame-to-frame unwrap.
+    fr.particles.image=np.c_[images,np.zeros(N,dtype=int)]
+    fr.particles.velocity=np.c_[vel,np.zeros(N)]; g.append(fr)
+
+
+def msd_vacf(times, pos, vel, max_lag, stride):
+    ns=len(times); m=min(max_lag,ns-1); out=[]
+    for lag in range(m+1):
+        origins=np.arange(0,ns-lag,stride,dtype=int)
+        dr=pos[origins+lag]-pos[origins]
+        vv=np.sum(vel[origins+lag]*vel[origins],axis=2)
+        out.append((times[lag]-times[0],np.mean(np.sum(dr*dr,axis=2)),np.mean(vv),len(origins)))
+    return np.asarray(out)
+
+
+def fit_D(a, frac):
+    ok=(a[:,0]>0)&np.isfinite(a[:,1]); ids=np.where(ok)[0]
+    if len(ids)<5: return np.nan, np.nan
+    ids=ids[int((1-frac)*len(ids)):]; slope,inter=np.polyfit(a[ids,0],a[ids,1],1)
+    return slope/4,inter
+
+
+def safe_analysis(system, name, key="total"):
+    try:
+        value=getattr(system.analysis,name)()
+        return float(value[key] if isinstance(value,dict) else value)
+    except Exception:
+        return np.nan
+
+
+def safe_min_dist(system):
+    try:
+        return float(system.analysis.min_dist())
+    except Exception:
+        return np.nan
+
+
+def temperatures(args):
+    if args.temperatures:
+        heat=np.asarray(args.temperatures,float)
+    else:
+        heat=np.arange(args.T_min,args.T_max+0.5*args.dT,args.dT)
+    heat=np.unique(np.round(heat,12)); heat.sort()
+    schedule=[]
+    if not args.cool_only: schedule += [("heating",float(T)) for T in heat]
+    if not args.heat_only: schedule += [("cooling",float(T)) for T in heat[::-1]]
+    return schedule
+
+
+def main():
+    p=argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--N",type=int,default=4096); p.add_argument("--rho",type=float,required=True)
+    p.add_argument("--seed",type=int,default=1); p.add_argument("--outdir",required=True)
+    p.add_argument("--T-min",type=float,default=.04); p.add_argument("--T-max",type=float,default=.20)
+    p.add_argument("--dT",type=float,default=.005); p.add_argument("--temperatures",type=float,nargs="+")
+    g=p.add_mutually_exclusive_group(); g.add_argument("--heat-only",action="store_true"); g.add_argument("--cool-only",action="store_true")
+    p.add_argument("--initial-config",help="NPZ restart/stripe configuration with pos and optionally vel,image_box,box")
+    p.add_argument("--stripe-nx",type=int,help="Generate a perfect stripe with this many particles per row (must divide N)")
+    p.add_argument("--stripe-scale-ratio",type=float,default=2.0/1.2,help="Target interstripe/intrastripe spacing ratio")
+    p.add_argument("--eps",type=float,default=1.); p.add_argument("--sigma",type=float,default=1.)
+    p.add_argument("--gauss-A",type=float,default=5.); p.add_argument("--gauss-r0",type=float,default=.7); p.add_argument("--gauss-c",type=float,default=1.)
+    p.add_argument("--r-min",type=float,default=0.0,help="Lower limit of the Gaussian table; LJ is evaluated natively")
+    p.add_argument("--r-cut",type=float,default=3.5); p.add_argument("--table-points",type=int,default=4000)
+    p.add_argument("--dt",type=float,default=.002); p.add_argument("--gamma",type=float,default=1.); p.add_argument("--skin",type=float,default=.4)
+    p.add_argument("--steps-eq-first",type=int,default=1000000); p.add_argument("--steps-eq",type=int,default=300000); p.add_argument("--steps-prod",type=int,default=500000)
+    p.add_argument("--integr-chunk",type=int,default=100); p.add_argument("--sample-every",type=int,default=1000); p.add_argument("--thermo-every",type=int,default=1000)
+    p.add_argument("--traj-every",type=int,default=5000); p.add_argument("--max-lag-samples",type=int,default=400); p.add_argument("--origin-stride",type=int,default=2); p.add_argument("--fit-fraction",type=float,default=.5)
+    p.add_argument("--no-trajectory",action="store_true")
+    a=p.parse_args(); root=Path(a.outdir); root.mkdir(parents=True,exist_ok=True)
+    if a.stripe_nx:
+        if a.N%a.stripe_nx: raise SystemExit("--stripe-nx must divide N")
+        ny=a.N//a.stripe_nx; ax=math.sqrt(1.0/(a.rho*a.stripe_scale_ratio)); ay=a.stripe_scale_ratio*ax
+        box=np.array([a.stripe_nx*ax,ny*ay])
+    else: box=np.array([math.sqrt(a.N/a.rho)]*2)
+    sys=espressomd.System(box_l=[box[0],box[1],10.]); sys.periodicity=[True,True,False]
+    sys.time_step=a.dt; sys.cell_system.skin=a.skin; sys.integrator.set_vv()
+    # Additive interactions: native LJ core plus a tabulated Gaussian shoulder.
+    # Using shift='auto' for LJ and subtracting U_G(r_cut) from the Gaussian
+    # reproduces the total LJ+Gaussian potential shifted to zero at r_cut.
+    pair = sys.non_bonded_inter[0,0]
+    pair.lennard_jones.set_params(
+        epsilon=a.eps, sigma=a.sigma, cutoff=a.r_cut, shift="auto"
+    )
+    u,f=gaussian_table(a)
+    pair.tabulated.set_params(
+        min=a.r_min,max=a.r_cut,energy=u.tolist(),force=f.tolist()
+    )
+    rng=np.random.default_rng(a.seed+13579)
+    if a.initial_config:
+        z=np.load(a.initial_config); pos=np.asarray(z["pos"]); vel=np.asarray(z["vel"]) if "vel" in z else rng.normal(0,math.sqrt(a.T_min),(a.N,2))
+        if len(pos)!=a.N: raise SystemExit("initial configuration N differs from --N")
+        if "box" in z:
+            box=np.asarray(z["box"],float); sys.change_volume_and_rescale_particles(float(box[0]),dir="x"); sys.change_volume_and_rescale_particles(float(box[1]),dir="y")
+    else:
+        if a.stripe_nx:
+            ny=a.N//a.stripe_nx; ax=box[0]/a.stripe_nx; ay=box[1]/ny
+            pos=np.array([[(ix+.5)*ax,(iy+.5)*ay,0.] for iy in range(ny) for ix in range(a.stripe_nx)])
+        else: pos=grid_positions(a.N,box[0],a.seed)
+        vel=rng.normal(0,math.sqrt(a.T_min),(a.N,2))
+    vel-=vel.mean(0)
+    for i in range(a.N):
+        q=sys.part.add(id=i,type=0,pos=[pos[i,0],pos[i,1],0.],v=[vel[i,0],vel[i,1],0.])
+        # Strictly two-dimensional dynamics.  Do not hide an error here: if
+        # ESPResSo cannot apply this constraint, the simulation must stop.
+        q.fix=[False,False,True]
+    initial_rmin=safe_min_dist(sys)
+    print(f"Initial configuration: box=({box[0]:.8g}, {box[1]:.8g}), "
+          f"rho={a.N/(box[0]*box[1]):.8g}, min_distance={initial_rmin:.8g}, "
+          f"initializer={'stripe' if a.stripe_nx else ('restart' if a.initial_config else 'perturbed_grid')}",
+          flush=True)
+    if np.isfinite(initial_rmin) and initial_rmin < 0.8*a.sigma:
+        raise RuntimeError(
+            f"Initial configuration has a severe overlap: r_min={initial_rmin:.8g} < 0.8 sigma"
+        )
+    (root/"metadata.json").write_text(json.dumps({**vars(a),"box":box.tolist(),"schedule":temperatures(a)},indent=2),encoding="utf8")
+    cycle_rows=[]
+    for ip,(direction,T) in enumerate(temperatures(a)):
+        tag=f"T_{T:.5f}"; od=root/direction/tag; od.mkdir(parents=True,exist_ok=True)
+        sys.thermostat.set_langevin(kT=T,gamma=a.gamma,seed=a.seed+10007*ip)
+        neq=a.steps_eq_first if ip==0 else a.steps_eq
+        for _ in range(neq//a.integr_chunk): sys.integrator.run(a.integr_chunk)
+        samples_t=[]; samples_x=[]; samples_v=[]; thermo=[]; gh=None
+        if not a.no_trajectory and a.traj_every>0:
+            try:
+                import gsd.hoomd; gh=gsd.hoomd.open(str(od/"trajectory.gsd"),mode="w")
+            except Exception as e: print("WARNING GSD:",e,flush=True)
+        nch=a.steps_prod//a.integr_chunk
+        for k in range(nch+1):
+            step=k*a.integr_chunk
+            if step%a.sample_every==0:
+                _,xu,v,_=get_state(sys,a.N,box); v-=v.mean(0); samples_t.append(sys.time); samples_x.append(xu); samples_v.append(v)
+            if step%a.thermo_every==0:
+                etot=safe_analysis(sys,"energy")
+                ekin=safe_analysis(sys,"energy","kinetic")
+                # For a strictly 2D system, E_kin = N k_B T.
+                thermo.append([sys.time,etot,ekin,ekin/a.N,
+                               safe_analysis(sys,"pressure"),safe_min_dist(sys)])
+            if gh is not None and step%a.traj_every==0: write_gsd(gh,sys,a.N,box)
+            if k<nch: sys.integrator.run(a.integr_chunk)
+        if gh is not None: gh.close()
+        mv=msd_vacf(np.asarray(samples_t),np.asarray(samples_x),np.asarray(samples_v),a.max_lag_samples,a.origin_stride)
+        D,inter=fit_D(mv,a.fit_fraction)
+        # np.trapz was removed from recent NumPy releases; trapezoid is the
+        # current name.  Keep the fallback for older NumPy installations.
+        integrate_trapezoid = getattr(np, "trapezoid", None)
+        if integrate_trapezoid is None:
+            integrate_trapezoid = np.trapz
+        Dg = 0.5 * integrate_trapezoid(mv[:, 2], mv[:, 0])
+        np.savetxt(od/"thermo.dat",np.asarray(thermo),
+                   header="time total_energy kinetic_energy T_kin_2D pressure min_distance")
+        np.savetxt(od/"msd_vacf.dat",mv,header="tau MSD VACF n_origins")
+        save_restart(od/"config_final.npz",sys,a.N,box,T,direction)
+        er=np.asarray(thermo)[:,1]; pr=np.asarray(thermo)[:,4]
+        row=[ip,T,0 if direction=="heating" else 1,np.nanmean(er)/a.N,np.nanstd(er,ddof=1)/a.N,np.nanmean(pr),np.nanstd(pr,ddof=1),D,Dg,inter,len(samples_t)]
+        cycle_rows.append(row); np.savetxt(root/"cycle_summary.dat",cycle_rows,header="index T branch(0_heat,1_cool) E_per_N E_std_per_N P P_std D_msd D_vacf msd_intercept nsamples")
+        print(f"{direction} T={T:.5f}: D={D:.6g}, E/N={row[3]:.6g}, P={row[5]:.6g}",flush=True)
+
+if __name__=="__main__": main()
